@@ -1,0 +1,45 @@
+-Pourquoi cli pour les exceptions mais pas le reste ?
+
+-regs2.cs = 0x08 et interruptible n'est-il pas une aberration ?
+	=> oui, regs2.cs = 0x08 est une aberration car pas d'appel système possible en mode noyau
+	=> panic dans _isr_syscall() si cela arrive
+
+-schedule_switch() : un else if(current->sigset) un peu douteux...
+	=> c'est pour du débogage
+
+-Les appels systèmes sont susceptibles de modifier l'ensemble des signaux du processus courant. Donc la procédure retenue pour retourner d'un appel système est de passer par schedule_switch(), ce qui permet de traiter les éventuels signaux.
+
+-Attention à 0x48000000
+	=> OK (les programmes ont été recompilés)
+
+-tty.c : abréger 1 condition dans tty_read()
+	=> MODIFIE (cf. eol_count)
+	=> [EDIT] En fait, il ne fallait rien faire ! En mode canonique, tty_read doit attendre un saut de ligne !
+
+-tty.c : tty_process() : 2 continue un peu louches...
+
+-tty.c : eol_count inutile ?
+	=> MODIFIE
+	=> [EDIT] En fait, non ! cf. plus haut
+
+-disk.c: code un peu lourd
+
+-tcp.c : il faudrait pouvoir personnaliser les délais d'attente (au lieu de CLK_FREQ invariablement)
+
+-ip.c : frag_end, hole->end, etc. devraient être signés pour éviter le recouvrement de fragments
+
+-ip.c : quand on récupère un tampon périmé, il faudrait réinitialiser sa taille à 0
+
+-ip.c : frag_end == 0xffff englobé dans le test juste en-dessous
+
+-tcp.c : clarifier les conventions quand au comportement en cas d'échec de la procédure d'ouverture ou de fermeture. Quand l'ouverture (active ou passive) échoue, mise à jour du chronomètre de la socket à chaque nouvelle tentative, et donc possibilité de réessayer à l'infini. Lors de la fermeture, on ne met pas à jour le chrono, mais on utilise un paramètre annexe (last_fin_ack_date). Il faudrait unifier cela en mettant chaque fois à jour le chrono tout en gardant un compteur du nombre de tentatives
+
+-tcp.c : dans tcp_receive(), un test sock->state == TCP_SYN_SENT s'est vu évincer ; de plus sock->seq_num = ack_num -> louche...
+	=> MODIFIE
+
+-tcp.c : tcp_receive() : clarification nécessaire -> baser la fonction sur un switch sur les états de la socket ; rassembler les tests sur les numéros de séquence
+
+-tcp.c : [CRITIQUE] tcp_receive() : !sock->ack_num : et si seq_num = 0xffffffff ?
+	=> MODIFIE
+
+-tcp.c : [CRITIQUE ?] recouvrement des numéros de séquence

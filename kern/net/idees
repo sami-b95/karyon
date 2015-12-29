@@ -1,0 +1,360 @@
+* Tous les paquets dont le numéro de séquence est différent du numéro
+  d'acquittement de la connexion doivent être ignorés, sauf :
+	- SYN
+	- SYN-ACK
+	- ACK
+
+* Traitement en fonction du type de paquet :
+	- SYN : si LISTENING, enregistrer la requête.
+	- SYN-ACK : si SYN_SENT :
+		-> envoyer un ACK
+		-> passer à CONNECTED
+	- (sinon) type ACK 
+		- si data_size, seq paquet = ack socket et CONNECTED,
+		  copier les données reçues ;
+		- si FIN_WAIT1 et ack paquet = seq socket, passer à FIN_WAIT3 ;
+		- si FIN_WAIT2 et ack paquet = seq socket, passer à TIME_WAIT
+		  et acquitter ;
+		- si CLOSING et ack packet = seq socket, passer à TIME_WAIT ;
+		- si data_size et >= CONNECTED, acquitter ;
+		- si CONNECTED, mettre à jour le numéro d'acquittement de la
+		  connexion tout en libérant les tampons inutilisés.
+	- type FIN
+		- si CONNECTED, seq paquet = ack socket (ou seq paquet = ack
+	          socket - 1), (r)envoyer un FIN-ACK et passer à CLOSING ;
+		- si FIN_WAIT1, seq paquet = ack socket, passer à FIN_WAIT2;
+		- si FIN_WAIT3, seq paquet = ack socket (ou seq paquet = ack
+	          socket - 1), (ré)acquitter et passer à TIME_WAIT.
+		- si TIME_WAIT, acquitter.
+	- type RST
+		- si >= CONNECTED, seq paquet = ack socket, envoyer un
+	          RST-ACK.
+
+* Tentative de codage :
+
+if((packet->flags & (TCP_SYN | TCP_ACK)) == TCP_SYN
+&& sock->state == TCP_LISTENING)
+{
+	tcp_request_push(sock,
+	                 source_ip,
+	                 dest_ip,
+	                 source_port,
+	                 dest_port,
+	                 seq_num);
+}
+else if((packet->flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK)
+     /*&& sock->state == TCP_SYN_SENT*/)
+{
+	if(!sock->ack_num)
+	{
+		sock->ack_num = seq_num + 1;
+	}
+
+	tcp_send_ack(sock);
+	tcp_set_socket_state(sock, TCP_CONNECTED);
+}
+else
+{
+	if(packet->flags & TCP_ACK)
+	{
+		if(data_size)
+		{
+			tcp_data_in(sock,
+			            seq_num,
+			            (void*)packet
+			            + 4 * packet->header_size,
+			            data_size);
+		}
+
+		if(sock->state == TCP_CONNECTED)
+		{
+			tcp_data_ack(sock, ack_num);
+		}
+
+		if(ack_num == sock->seq_num)
+		{
+			/** The test above ensures that the remote host
+			    has acknowledged all the packets we've sent
+			    up to now. **/
+
+			if(sock->state == TCP_FIN_WAIT1)
+			{
+				tcp_set_socket_state(sock,
+				                     TCP_FIN_WAIT3);
+			}
+			else if(sock->state == TCP_FIN_WAIT2)
+			{
+				tcp_send_ack(sock);
+				tcp_set_socket_state(sock,
+				                     TCP_TIME_WAIT);
+			}
+			else if(sock->state == TCP_CLOSING)
+			{
+				tcp_set_socket_state(sock,
+				                     TCP_TIME_WAIT);
+			}
+		}
+	}
+
+	if((packet->flags & TCP_FIN) && seq_num == sock->ack_num)
+	{
+		sock->ack_num = seq_num + 1;
+		sock->seq_num = ack_num;
+
+		if(sock->state == TCP_CONNECTED)
+		{
+			tcp_send_packet(sock,
+			                sock->seq_num,
+			                0,
+			                0,
+			                TCP_FIN | TCP_ACK);
+		sock->seq_num++;
+			tcp_set_socket_state(sock, TCP_CLOSING);
+		}
+		else if(sock->state == TCP_FIN_WAIT1)
+		{
+			/** FIXME: Can it happen? EDIT: Yes: if at the
+			    same time host 1 sends a FIN to host2 and
+			    host2 send a FIN to host1 (both host being
+			    initially in state TCP_CONNECTED, then
+			    host1 and host2 may face this
+			    situation. **/
+
+			tcp_send_ack(sock);
+			tcp_set_socket_state(sock, TCP_FIN_WAIT2);
+		}
+		else if(sock->state == TCP_FIN_WAIT3)
+		{
+			tcp_send_ack(sock);
+			tcp_set_socket_state(sock, TCP_TIME_WAIT);
+		}
+		else if(sock->state == TCP_TIME_WAIT)
+		{
+			tcp_send_ack(sock);
+		}
+	}
+
+	if((packet->flags & TCP_RST) && seq_num == sock->ack_num)
+	{
+		sock->seq_num = ack_num;
+		tcp_send_packet(sock, sock->seq_num, 0, 0, TCP_RST
+		                                         | TCP_ACK);
+		sock->seq_num++;
+	}
+}
+
+void tcp_data_in(struct tcp_socket *sock,
+                 ui32_t seq_num,
+                 void *data,
+                 size_t size)
+{
+	if(sock->state < TCP_CONNECTED)
+	{
+		return;
+	}
+
+	if(seq_num == sock->ack_num)
+	{
+		if(sock->state == TCP_CONNECTED)
+		{
+			if(fifo_left(&sock->rx_fifo) < size)
+			{
+				return;
+			}
+
+			if(fifo_write(&sock->rx_fifo, data, size, 0) != 0)
+			{
+				panic("critical error with fifo");
+			}
+		}
+
+		sock->ack_num += size;
+	}
+
+	tcp_send_ack(sock);
+}
+
+void tcp_data_ack(struct tcp_socket *sock, ui32_t ack_num)
+{
+	struct tcp_buffer *buf = &sock->buf_tab[sock->buf_head];
+
+	while(sock->free_buf < TCP_BUF_PER_SOCK
+	   && buf->state == TCP_WAITING_ACK
+	   && (buf->seq_num + buf->size) <= ack_num)
+	{
+		tcp_set_buffer_state(sock, buf, TCP_FREE);
+		sock->buf_head = (sock->buf_head + 1) % TCP_BUF_PER_SOCK;
+		buf = &sock->buf_tab[sock->buf_head];
+	}
+
+	#ifdef DEBUG_TCP
+	if(sock->free_buf < TCP_BUF_PER_SOCK && buf->seq_num != ack_num)
+	{
+		panic("seq/ack numbers are unconsistent");
+	}
+	#endif
+}
+
+* Ce que doit faire le callback pour chaque socket :
+	- si la socket est TCP_WAIT_ACTIVE_CLOSE et tous les paquets ont été
+	  transmis, initier une fermeture active ;
+	- si la socket est TCP_FIN_WAIT1 ou TCP_FIN_WAIT2 depuis plus d'une
+	  seconde, renvoyer le paquet FIN(-ACK) ;
+	- si la socket est TCP_FIN_WAIT3 depuis plus de deux minutes, passer à
+	  TIME_WAIT ;
+	- si la socket est TCP_CLOSING depuis plus d'une seconde, renvoyer
+	  le paquet FIN-ACK ;
+	- si la socket est TCP_TIME_WAIT depuis deux minutes, passer à
+	  TCP_CLOSED ;
+	- s'il y a des paquets à transmettre, transmettre des paquets jusqu'à
+	  occupation de tous les tampons de transmission du pilote RTL8139.
+
+* Tentative de codage :
+
+void tcp_callback()
+{
+	static si32_t prev_sock_id = NR_TCP_SOCKS - 1;
+	si32_t sock_id;
+	struct tcp_socket *sock;
+	off_t buf_head;
+	struct tcp_buffer *buf;
+
+	/** Get the first used socket following the one we dealt with in
+	    the previous call to this function. **/
+
+	sock_id = (prev_sock_id + 1) % NR_TCP_SOCKS;
+
+	while(sock_id != prev_sock_id)
+	{
+		if(tcp_sock_tab[sock_id].state != TCP_CLOSED
+		|| tcp_sock_tab[sock_id].used)
+		{
+			break;
+		}
+
+		sock_id = (sock_id + 1) % NR_TCP_SOCKS;
+	}
+
+	prev_sock_id = sock_id;
+	sock = &tcp_sock_tab[sock_id];
+
+	if(!sock->used)
+	{
+		return;
+	}
+
+	/** Connection closure stuff. **/
+
+	if(sock->state == TCP_WAIT_ACTIVE_CLOSE
+	&& (sock->free_buf == TCP_BUF_PER_SOCK
+	 || sock->buf_tab[sock->buf_head].state == TCP_FAIL))
+	{
+		tcp_send(sock, sock->seq_num, 0, 0, TCP_FIN | TCP_ACK);
+		sock->seq_num++;
+		tcp_set_socket_state(sock, TCP_FIN_WAIT1);
+	}
+
+	if(tics > (sock->state_change_date + CLK_FREQ)
+	&& (sock->state == TCP_FIN_WAIT1
+	 || sock->state == TCP_FIN_WAIT2
+	 || sock->state == TCP_CLOSING))
+	{
+		tcp_send(sock, sock->seq_num - 1, 0, 0, TCP_FIN | TCP_ACK);
+		tcp_set_socket_state(sock, sock->state);
+	}
+
+	if(tics > (sock->state_change_date + TCP_SOCK_DELAY))
+	{
+		if(sock->state == TCP_FIN_WAIT3)
+		{
+			tcp_set_socket_state(sock, TCP_TIME_WAIT);
+		}
+		else if(sock->state == TCP_TIME_WAIT)
+		{
+			tcp_set_socket_state(sock, TCP_CLOSED);
+		}
+	}
+
+	/** If there is nothing to transmit, return. **/
+
+	if(sock->free_buf == TCP_BUF_PER_SOCK)
+	{
+		return;
+	}
+
+	/** Transmit as many packets as possible. **/
+
+	buf_head = sock->buf_head;
+
+	do
+	{
+		buf = &sock->buf_tab[buf_head];
+
+		if((tics <= buf->state_change_date + sock->rtt + 4 * sock->vrtt
+		    && buf->state == TCP_WAITING_ACK)
+		|| (buf->state != TCP_WAITING_SEND
+		    && buf->state != TCP_WAITING_ACK))
+		{
+			continue;
+		}
+
+		if(buf->try_cnt > TCP_NET_RETRY)
+		{
+			tcp_set_buffer_state(sock, buf, TCP_FAIL);
+		}
+
+		if(buf->state == TCP_FAIL
+		|| tcp_send(sock, buf->seq_num, buf->data, buf->size, TCP_ACK)
+		   != OK)
+		{
+			break;
+		}
+
+		tcp_set_buffer_state(sock, buf, TCP_WAITING_ACK);
+		buf->try_cnt++;
+		buf_head = (buf_head + 1) % TCP_BUF_PER_SOCK;
+	} while(buf_head != sock->buf_head && free_tx_desc);
+}
+
+* Mise en file d'attente de données à envoyer. Code :
+
+ret_t tcp_data_out(struct tcp_socket *sock, void *data, size_t size)
+{
+	size_t copy_size;
+	struct tcp_buffer *buf = &sock->buf_tab[sock->buf_tail];
+
+	if(sock->free_buf * TCP_BUF_SIZE < size)
+	{
+		return -ENOMEM;
+	}
+
+	while(size)
+	{
+		copy_size = (size > TCP_BUF_SIZE) ? TCP_BUF_SIZE : size;
+		buf = &sock->buf_tab[sock->buf_tail];
+
+		memcpy(buf->data, data, copy_size);
+
+		/** tcp_set_buffer_state() should decrease sock->free_buf. **/
+
+		tcp_set_buffer_state(sock, buf, TCP_WAITING_SEND);
+		buf->seq_num = sock->seq_num;
+		buf->size = copy_size;
+		buf->try_cnt = 0;
+
+		sock->seq_num += copy_size;
+		data += copy_size;
+		size -= copy_size;
+		sock->buf_tail = (sock->buf_tail + 1) % TCP_BUF_PER_SOCK;
+		buf = &sock->buf_tab[sock->buf_tail];
+	}
+
+	return OK;
+}
+
+26/07/2014 :
+
+Il faut assurer que toutes les données arrivent à destination.
+
+-Quand une socket est fermée activement, elle ne peut plus envoyer de données supplémentaires mais doit s'attendre à en recevoir.
+-Quand une socket est fermée passivement, elle ne peut pas recevoir de données supplémentaires mais il se peut qu'elle en ait à envoyer.
