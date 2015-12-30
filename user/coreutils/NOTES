@@ -1,0 +1,2 @@
+-17/01/2015:
+	-Options fonctionnelles : ../coreutils-8.23/configure --prefix=$KARYON_SYSROOT --host=i586-pc-karyon --disable-nls --enable-no-install-program=stdbuf

@@ -1,0 +1,7 @@
+ifndef KARYON_SYSROOT
+$(error Please define KARYON_SYSROOT)
+endif
+
+ifndef KARYON_TCHAIN_ROOT
+$(error Please define KARYON_TCHAIN_ROOT)
+endif
